@@ -223,9 +223,12 @@ for (i in seq_along(lista_ultimo)) {
 dados1 <- lista_soma %>% reduce(full_join, by = c('Data', 'Fundo'))
 dados2 <- lista_ultimo %>% reduce(full_join, by = c('Data', 'Fundo'))
 
-dados <- merge(dados1, dados2, by = c('Data', 'Fundo'), all = TRUE)
+dados_mes <- merge(dados1, dados2, by = c('Data', 'Fundo'), all = TRUE)
+
+dados_mes$Data <- ceiling_date(as.Date(dados_mes$Data), 'month') - 1
 
 dados_diarios <- list(capt_liq, captacao, cota, n_cotistas, patrim_liq, resgate, tx_adm)
+names(dados_diarios) <- c('capt_liq', 'capt', 'cota', 'n_cotistas', 'patrim_liq', 'resg', 'tx_adm')
 
 # Eliminamos listas e dfs
 rm(df_mes, df, dados1, dados2, lista_soma, lista_ultimo, codigo, capt_liq, captacao, cota, n_cotistas, patrim_liq, resgate, tx_adm)
@@ -233,9 +236,7 @@ rm(df_mes, df, dados1, dados2, lista_soma, lista_ultimo, codigo, capt_liq, capta
 # Eliminamos valores e funcoes
 rm(i, nome_valores, junta_bd, limpa_bd)
 
-# Eliminamos a lista com os dados diarios. Caso voce queira os dados diarios, basta nao rodar a linha abaixo
-#rm(dados_diarios)
-
-save.image(file = 'dados_tratados.RData')
-
-#load('dados_tratados.RData')
+# Salvamos os dados tratados. Para ler: readRDS('dados_tratados_mes.rds')
+saveRDS(dados_mes, file = 'dados_tratados_mes.rds')
+saveRDS(dados_cadast, file = 'dados_cadastrais.rds')
+saveRDS(dados_diarios, file = 'dados_tratados_diarios.rds')
