@@ -168,75 +168,73 @@ dados_cadast$benchmark <- replace(dados_cadast$benchmark, dados_cadast$benchmark
 
 # OBS: unique(dados_cadast$classe) retorna Fundo Multimercado e Fundo de Renda Fixa tambem
 
-# Eliminamos a lista com os dados dos 10 fundos
-rm(dados_10)
-
-# Mensalizacao dos dados ----
-
-# Temos alguns tipos de dados que precisamos somar os valores de cada mes e outros que precisamos apenas do ultimo valor
-lista_soma <- list(capt_liq, captacao, resgate)
-lista_ultimo <- list(cota, n_cotistas, patrim_liq, tx_adm)
-
-# Transformamos o dado de diario para mensal somando os valores dentro de cada mes
-nome_valores <- c('capt_liq', 'captacao', 'resgate')
-for (i in seq_along(lista_soma)) {
-  df <- lista_soma[[i]]
-  
-  df <- xts(df[,-1], df$Data)
-  
-  # Para cada coluna aplicamos a funcao apply.monthly
-  df_mes <- do.call('cbind', lapply(df, function(x) apply.monthly(x, function(y) sum(y, na.rm = TRUE))))
-  
-  df_mes <- data.frame(Data = index(df_mes), df_mes)
-  
-  names(df_mes) <- sapply(str_remove_all(colnames(df_mes),"X"),"[")
-  
-  df_mes[df_mes == 0] <- NA
-  
-  df_mes <- df_mes %>% pivot_longer(!Data, names_to = 'Fundo', values_to = nome_valores[i])
-  
-  # Atualizamos nossa lista com o valor mensal
-  lista_soma[[i]] <- df_mes
-}
-
-# Transformamos o dado de diario para mensal selecionando o ultimo valor dentro de cada mes
-nome_valores <- c('cota', 'n_cotistas', 'patrim_liq', 'tx_adm')
-for (i in seq_along(lista_ultimo)) {
-  df <- lista_ultimo[[i]]
-  
-  df <- xts(df[,-1], df$Data)
-  
-  # Para cada coluna aplicamos a funcao apply.monthly para selecionar a ultima observacao de cada mes diferente de NA
-  df_mes <- do.call('cbind', lapply(df, function(x) apply.monthly(x, function(y) lastNotNa(y, NA))))
-  
-  df_mes <- data.frame(Data = index(df_mes), df_mes)
-  
-  names(df_mes) <- sapply(str_remove_all(colnames(df_mes),"X"),"[")
-  
-  df_mes <- df_mes %>% pivot_longer(!Data, names_to = 'Fundo', values_to = nome_valores[i])
-  
-  # Atualizamos nossa lista com o valor mensal
-  lista_ultimo[[i]] <- df_mes
-}
-
-# Temos 2 listas com nossos dados. Primeiro, fazemos merge dentro de cada lista. Por fim, fazemos o merge das duas dfs
-dados1 <- lista_soma %>% reduce(full_join, by = c('Data', 'Fundo'))
-dados2 <- lista_ultimo %>% reduce(full_join, by = c('Data', 'Fundo'))
-
-dados_mes <- merge(dados1, dados2, by = c('Data', 'Fundo'), all = TRUE)
-
-dados_mes$Data <- ceiling_date(as.Date(dados_mes$Data), 'month') - 1
-
+# Jutamos os dados diários em uma lista
 dados_diarios <- list(capt_liq, captacao, cota, n_cotistas, patrim_liq, resgate, tx_adm)
 names(dados_diarios) <- c('capt_liq', 'capt', 'cota', 'n_cotistas', 'patrim_liq', 'resg', 'tx_adm')
 
-# Eliminamos listas e dfs
-rm(df_mes, df, dados1, dados2, lista_soma, lista_ultimo, codigo, capt_liq, captacao, cota, n_cotistas, patrim_liq, resgate, tx_adm)
+##################################################################
+##                     Calculo Retorno Cota                     ##
+##################################################################
 
-# Eliminamos valores e funcoes
-rm(i, nome_valores, junta_bd, limpa_bd)
+## If an asset hasn't any price data, we eliminate it from our database
+prices <- dados_diarios[['cota']]
+prices <- prices[, colSums(is.na(prices)) != nrow(prices)]
+
+## We iterate to fill the NAs in the middle of the sample
+prices_locf <- data.frame(matrix(ncol = ncol(prices) - 1, nrow = nrow(prices)))
+for (i in 2:ncol(prices)) {
+  ind_date <- prices[, 1, drop = FALSE]
+  # Select only the date column and the asset in position i
+  suport1 <- prices[, c(1, i)]
+  # Create a vector that informs the position of the non NA observations
+  NonNAindex <- which(!is.na(suport1[, 2]))
+  # Filter so we can work only with the dates before an asset, possibly, delists.
+  # This will avoid problems with the na.locf function
+  suport2 <- suport1[1:max(NonNAindex), ]
+  # Use the na.locf function to replace NAs with the last available information
+  suport3 <- na.locf(suport2)
+  # Add the asset prices to the data frame using it's date column
+  prices_locf[[i - 1]] <- merge(ind_date, suport3, by = "Data", all.x = TRUE)[, 2]
+}
+
+## Calculate assets returns from the price data
+returns <- as.data.frame(lapply(prices_locf, function(x) diff(x) / x[-length(x)])) %>%
+  set_names(colnames(prices)[-1]) %>%
+  dplyr::mutate(Data = prices$Data[-1], .before = 1)
+
+dados_diarios[['cota']] <- returns
+
+##################################################################
+##                 Preencher Patrimônio Líquido                 ##
+##################################################################
+
+## If an asset hasn't any price data, we eliminate it from our database
+pl <- dados_diarios[['patrim_liq']]
+pl <- pl[, colSums(is.na(pl)) != nrow(pl)]
+
+## We iterate to fill the NAs in the middle of the sample
+pl_locf <- data.frame(matrix(ncol = ncol(pl) - 1, nrow = nrow(pl)))
+for (i in 2:ncol(pl)) {
+  ind_date <- pl[, 1, drop = FALSE]
+  # Select only the date column and the asset in position i
+  suport1 <- pl[, c(1, i)]
+  # Create a vector that informs the position of the non NA observations
+  NonNAindex <- which(!is.na(suport1[, 2]))
+  # Filter so we can work only with the dates before an asset, possibly, delists.
+  # This will avoid problems with the na.locf function
+  suport2 <- suport1[1:max(NonNAindex), ]
+  # Use the na.locf function to replace NAs with the last available information
+  suport3 <- na.locf(suport2)
+  # Add the asset pl to the data frame using it's date column
+  pl_locf[[i - 1]] <- merge(ind_date, suport3, by = "Data", all.x = TRUE)[, 2]
+}
+
+pl <- pl_locf %>%
+  set_names(colnames(pl)[-1]) %>%
+  dplyr::mutate(Data = pl$Data, .before = 1) 
+
+dados_diarios[['patrim_liq']] <- pl
 
 # Salvamos os dados tratados. Para ler: readRDS('dados_tratados_mes.rds')
-saveRDS(dados_mes, file = 'dados_tratados_mes.rds')
 saveRDS(dados_cadast, file = 'dados_cadastrais.rds')
 saveRDS(dados_diarios, file = 'dados_tratados_diarios.rds')
