@@ -176,8 +176,12 @@ names(dados_diarios) <- c('capt_liq', 'capt', 'cota', 'n_cotistas', 'patrim_liq'
 ##                     Calculo Retorno Cota                     ##
 ##################################################################
 
-## If an asset hasn't any price data, we eliminate it from our database
+# Garantir que as datas sao as mesmas que o indice de mercado
+ind_rf <- read.csv('ind_rf.csv')
+ind_rf$Data <- as.Date(ind_rf$Data)
+
 prices <- dados_diarios[['cota']]
+## If an asset hasn't any price data, we eliminate it from our database
 prices <- prices[, colSums(is.na(prices)) != nrow(prices)]
 
 ## We iterate to fill the NAs in the middle of the sample
@@ -197,6 +201,8 @@ for (i in 2:ncol(prices)) {
   prices_locf[[i - 1]] <- merge(ind_date, suport3, by = "Data", all.x = TRUE)[, 2]
 }
 
+prices_locf <- merge(ind_rf[, 1, drop = FALSE], prices_locf, by = "Data", all.x = TRUE)
+
 ## Calculate assets returns from the price data
 returns <- as.data.frame(lapply(prices_locf, function(x) diff(x) / x[-length(x)])) %>%
   set_names(colnames(prices)[-1]) %>%
@@ -209,6 +215,7 @@ dados_diarios[['cota']] <- returns
 ##################################################################
 
 ## If an asset hasn't any price data, we eliminate it from our database
+## Select price data only when there is market index data
 pl <- dados_diarios[['patrim_liq']]
 pl <- pl[, colSums(is.na(pl)) != nrow(pl)]
 
@@ -233,7 +240,59 @@ pl <- pl_locf %>%
   set_names(colnames(pl)[-1]) %>%
   dplyr::mutate(Data = pl$Data, .before = 1) 
 
+pl <- merge(ind_rf[, 1, drop = FALSE], pl, by = "Data", all.x = TRUE)
+
 dados_diarios[['patrim_liq']] <- pl
+
+
+##################################################################
+##          Captacao, Resgate e Captacao Liquida                ##
+##################################################################
+
+test_capt_liq <- dados_diarios[['capt_liq']]
+
+for (flow_type in c('capt', 'resg', 'capt_liq')) {
+  ## If an asset hasn't any price data, we eliminate it from our database
+  flow <- test_capt_liq
+  flow <- flow[, colSums(is.na(flow)) != nrow(flow)]
+  
+  ## We iterate to fill the NAs in the middle of the samflowe
+  flow_locf <- data.frame(matrix(ncol = ncol(flow) - 1, nrow = nrow(flow)))
+  for (i in 2:ncol(flow)) {
+    ind_date <- flow[, 1, drop = FALSE]
+    # Select only the date column and the asset in position i
+    suport1 <- flow[, c(1, i)]
+    # When the fund starts and ends?
+    fund_number <- colnames(suport1)[2]
+    datas <- dados_cadast %>% dplyr::filter(codigo == fund_number) %>% dplyr::select(data_inicio, data_fim)
+    data_inicio <- as.Date(datas$data_inicio)
+    data_fim <- as.Date(datas$data_fim)
+    data_fim <- if(is.na(data_fim)) suport1$Data[length(suport1$Data)] else data_fim
+    # We need one day before the start of the fund to ensure that the firts inflow is considered (cumsum)
+    if(data_inicio >= "2000-01-01"){
+      one_before_begin_date <- ind_date %>% dplyr::filter(Data < data_inicio)
+      data_inicio <- one_before_begin_date$Data[length(one_before_begin_date$Data)]
+    }
+    # Filter so we can work only with the dates before an asset delists.
+    suport1 <- suport1 %>% dplyr::filter(Data >= data_inicio & Data <= data_fim)
+    # Use the na.locf function to reflowace NAs with the last available information
+    suport1[is.na(suport1)] <- 0
+    # soma cumulativa para depois fazermos o merge com as datas do indice
+    suport1[,2] <- cumsum(suport1[,2])
+    # Add the asset flow to the data frame using it's date column
+    flow_locf[[i - 1]] <- merge(ind_date, suport1, by = "Data", all.x = TRUE)[, 2]
+  }
+  
+  flow_locf <- flow_locf %>%
+    set_names(colnames(flow)[-1]) %>%
+    dplyr::mutate(Data = flow$Data, .before = 1) 
+  
+  flow_locf <- merge(ind_rf[, 1, drop = FALSE], flow_locf, by = "Data", all.x = TRUE)
+  
+  flow_locf[,-1] <- lapply(flow_locf[,-1], function(x) append(NA, diff(x)))
+  
+  dados_diarios[[flow_type]] <- flow_locf
+}
 
 # Salvamos os dados tratados. Para ler: readRDS('dados_tratados_mes.rds')
 saveRDS(dados_cadast, file = 'dados_cadastrais.rds')

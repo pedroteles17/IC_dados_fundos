@@ -57,10 +57,12 @@ n_meses <- interval(ymd(20091231), ymd(20201231)) %/% months(1) + 1
 
 # Criamos uma lista vazia para guardar os fundos elegiveis em cada mes
 lista_fundos_eleg <- list()
+# Look back in months
+look_back <- 12
 for (i in 1:n_meses) {
   # Periodo para determinacao dos ativos elegiveis com base em uma janela movel de 12 meses
   fim_estim <- ymd(20091231) %m+% months(i-1)
-  inicio_estim <- fim_estim %m-% months(12)
+  inicio_estim <- fim_estim %m-% months(look_back)
   inicio_estim <- ceiling_date(inicio_estim, 'months') - 1
   
   # Selecionamos os fundos que ja existiam no inicio do periodo de estimacao e que nao deixaram de existir apos o fim do periodo de estimacao
@@ -70,13 +72,14 @@ for (i in 1:n_meses) {
   fundos_eleg <- fundos_existe$codigo
   
   # Filtramos a base de dados de cota para termos apenas o periodo de 12 meses
-  cota_periodo <- cota_diario %>% dplyr::filter(Data > inicio_estim & Data <= fim_estim) %>% dplyr::select(all_of(fundos_eleg))
+  ## Garantimos que nao temos NA (fundo existia antes do look_back e ate o fim_estim)
+  ## E que o fundo e liquido o suficiente
+  cota_periodo <- cota_diario %>% dplyr::filter(Data > inicio_estim & Data <= fim_estim) %>%
+    dplyr::select(all_of(fundos_eleg)) %>% 
+    dplyr::select_if(~ !any(is.na(.))) %>%
+    dplyr::select_if(function(x) sum(x != 0) %ni% 0:(look_back*21*0.20))
   
-  # Definimos a proporcao de nao NAs de cada fundo
-  prop_na <- apply(cota_periodo, 2, function(cota_fundo) sum(!is.na(cota_fundo), na.rm = TRUE) / length(cota_fundo))
-  
-  # Definimos uma variavel com o codigo dos fundos que possuem dados para mais de 80% dos dias
-  fundos_eleg <- names(prop_na[prop_na >= 0.8])
+  fundos_eleg <- colnames(cota_periodo)[-1]
   
   # Verificamos se esses fundos possuem um PL medio no ultimo mes maior que 5MM (restricao 3)
   
