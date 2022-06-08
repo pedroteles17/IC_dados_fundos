@@ -177,8 +177,15 @@ names(dados_diarios) <- c('capt_liq', 'capt', 'cota', 'n_cotistas', 'patrim_liq'
 ##################################################################
 
 # Garantir que as datas sao as mesmas que o indice de mercado
-ind_rf <- read.csv('ind_rf.csv')
-ind_rf$Data <- as.Date(ind_rf$Data)
+ind <- read.csv('indice.csv')
+ind$Data <- as.Date(ind$Data)
+
+rf <- read.csv('rf.csv')
+rf$Data <- as.Date(rf$Data)
+
+ind_rf <- ind %>% mutate(rf$Risk_free) %>% set_names('Data', 'ret_ibx', 'ret_rf')
+
+rm(ind, rf)
 
 prices <- dados_diarios[['cota']]
 ## If an asset hasn't any price data, we eliminate it from our database
@@ -201,12 +208,14 @@ for (i in 2:ncol(prices)) {
   prices_locf[[i - 1]] <- merge(ind_date, suport3, by = "Data", all.x = TRUE)[, 2]
 }
 
+prices_locf <- prices_locf %>% dplyr::mutate(Data = prices$Data, .before = 1)
+  
 prices_locf <- merge(ind_rf[, 1, drop = FALSE], prices_locf, by = "Data", all.x = TRUE)
 
 ## Calculate assets returns from the price data
-returns <- as.data.frame(lapply(prices_locf, function(x) diff(x) / x[-length(x)])) %>%
+returns <- as.data.frame(lapply(prices_locf[,-1], function(x) diff(x) / x[-length(x)])) %>%
   set_names(colnames(prices)[-1]) %>%
-  dplyr::mutate(Data = prices$Data[-1], .before = 1)
+  dplyr::mutate(Data = ind_rf$Data[-1], .before = 1)
 
 dados_diarios[['cota']] <- returns
 
@@ -248,8 +257,6 @@ dados_diarios[['patrim_liq']] <- pl
 ##################################################################
 ##          Captacao, Resgate e Captacao Liquida                ##
 ##################################################################
-
-test_capt_liq <- dados_diarios[['capt_liq']]
 
 for (flow_type in c('capt', 'resg', 'capt_liq')) {
   ## If an asset hasn't any price data, we eliminate it from our database
