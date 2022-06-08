@@ -1,11 +1,23 @@
 # Introdução
-Esse repositório contém dados diários e mensais para todos os fundos de ação livre existentes ou que deixaram de existir no Brasil. Os dados foram extraídos da Economática e serão utilizados em um artigo acadêmico.
+Esse repositório contém dados diários para todos os fundos de ação livre existentes ou que deixaram de existir no Brasil. Os dados foram extraídos da Economática e serão utilizados em um artigo acadêmico.
 
 # Tratamento dos Dados
 Uma explicação acerca do processo de tratamento de dados pode ser encontrado no arquivo README na pasta 'rawData'.
 
-O resultado do tratamento de dados é o 'dados_tratados'. Esse é um arquivo .Rdata que possui três componentes principais.
+O resultado do tratamento de dados são dois arquivos:
 
-1 - dados: Dataframe no formato long (painel) contendo dados mensais de diversos indicadores para todos os fundos de ação livre que existem ou já existiram.
-2 - dados_cadast: Dataframe contendo dados cadastrais de cada fundo. Optamos por não fazer o merge com o 'dados' porque iria aumentar significativamente o tamanho do arquivo. Esses dados precisam ser levados em consideração com cuidado dado que não temos informação sobre eles na escala temporal, apenas cross sectional.
-3 - dados_diarios: Lista contendo os dados diários para cada indicador. É possível transformar em uma tabela única no formato long, mas teriam milhões de linhas.  
+1- 'dados_tratados_diario.rds': dados diários relacionados a cada fundo
+2- 'dados_cadastrais.rds': dados cadastrais relacionados a cada fundo
+
+# indice.csv e rf.csv
+
+indice.csv: csv com o retorno diário do índice de mercado (IBX)
+rf.csv: csv com o retorno diário da taxa livre de risco (CDI)
+
+# prepare_data_model.R
+
+Preparamos os dados para modelagem. 
+
+Criamos três variáveis que podem ser utilizadas como variáveis dependentes. Uma para regressão ("regres_flows") e três para classificação ("closed","outperf", "classif_flows").
+
+Além disso, temos múltiplas variáveis independentes que podem ser utilizadas para modelar as variáveis dependentes.
