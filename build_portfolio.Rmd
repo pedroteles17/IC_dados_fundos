@@ -1,0 +1,460 @@
+---
+title: "Building Portfolio"
+output: html_notebook
+---
+
+# Packages
+
+```{r, message=FALSE, warning=FALSE, results='hide'}
+library(tidyverse)
+library(readxl)
+library(xts)
+library(PerformanceAnalytics)
+library(lubridate)
+library(stargazer)
+library(ggrepel)
+
+`%ni%` <- Negate(`%in%`)
+```
+
+# Import Data
+
+Index return (IBX) and Risk free return (CDI):
+
+```{r}
+ind <- read.csv("indice.csv")
+ind$Data <- as.Date(ind$Data)
+
+rf <- read.csv("rf.csv")
+rf$Data <- as.Date(rf$Data)
+
+ind_rf <- ind %>%
+  mutate(rf$Risk_free) %>%
+  set_names("Data", "ret_ibx", "ret_rf")
+
+nefin <- read_excel('fatores_nefin.xls') %>% 
+  mutate(Data = make_date(year, month, day)) %>% 
+  dplyr::select(!c(year, month, day)) %>% 
+  dplyr::select(Data, everything()) %>% 
+  dplyr::filter(Data <= '2021-12-30') %>% 
+  slice(-1)
+
+rm(ind, rf)
+```
+
+Funds' information:
+
+```{r}
+daily_data <- readRDS("dados_tratados_diarios.rds")
+names(daily_data) <- c("capt_liq", "capt", "cota", "n_cotistas", "patrim_liq", "resg", "tx_adm")
+```
+
+We have some outliers in our return database
+
+```{r}
+# Winsorizing
+daily_data[['cota']][,-1][daily_data[['cota']][,-1] <= -0.95 | daily_data[['cota']][,-1] > 1] <- 0
+```
+
+# Build Portfolio
+
+## Auxiliary Functions
+
+```{r}
+get_backtest_dates <- function(start_date, end_date, hold_period) {
+  # Number of months between the start and end date
+  n_months <- ceiling(interval(ymd(start_date), ymd(end_date)) / months(1)) - 1
+  
+  # After the estimation ends, we start the holding period
+  start_hold_period <- ymd(start_date) %m+% months(seq(0, n_months, by = hold_period))
+  # start holding period plus the rebalance frequency
+  end_hold_period <- ymd(start_date) %m+% months(hold_period + seq(0, n_months, by = hold_period))
+  
+  backtest_dates <- data.frame(start_hold_period, end_hold_period)
+  
+  return(backtest_dates)
+}
+```
+
+```{r, warning = FALSE}
+# Import the data with the predictions
+predictions <- read.csv('predictions/XGBRegressor.csv')
+
+# Import the data with the features
+features <- read.csv('data_modelling.csv') %>% 
+  mutate(date = make_date(year = year, month = month, day = 1), .before = 1) %>% 
+  dplyr::select(codigo, date, aum, inflow, outflow, shareholders, alavancado, fundo_cotas, fundo_exclusivo, age) 
+  
+
+diff_db <- setdiff(as.character(predictions$funds_code), colnames(daily_data[['cota']])[-1])
+
+n_ports <- 10
+
+dates <- get_backtest_dates(20080101, 20211231, 1)
+
+features_decile_dates <- vector('list', length = nrow(dates))
+ret_decile_dates <- vector('list', length = nrow(dates))
+for (i in 1:nrow(dates)) {
+  
+  start_hold_period <- dates$start_hold_period[i]
+  end_hold_period <- dates$end_hold_period[i]
+  
+  predictions_month <- predictions %>% 
+    dplyr::filter(date == start_hold_period) %>% 
+    arrange(desc(prediction)) %>% 
+    dplyr::filter(funds_code %ni% diff_db)
+
+  # We find the break points to divide the data frame in 'n_ports' (10, e.g.) equal parts
+  x <- 1:nrow(predictions_month)
+  split_seq <- split(x, cut(x, n_ports, labels = FALSE))
+  
+  assets_decile <- lapply(split_seq, function(x) predictions_month$funds_code[x])
+  
+  features_decile <- vector('list', length = n_ports)
+  ret_decile <- vector('list', length = length(assets_decile))
+  for (j in seq_along(assets_decile)) {
+    # Calculate portfolio returns
+    cota_hold_period <- daily_data[['cota']] %>% 
+      dplyr::filter(Data >= start_hold_period & Data < end_hold_period) %>% 
+      dplyr::select(Data, all_of(as.character(assets_decile[[j]])))
+    cota_hold_period <- xts(cota_hold_period[, -1], cota_hold_period$Data)
+    
+    weights <- rep(1 / ncol(cota_hold_period), ncol(cota_hold_period))
+    
+    ret_decile[[j]] <- Return.portfolio(cota_hold_period, weights = weights)
+    
+    # Funds info
+    features_month <- features %>% 
+      dplyr::filter(date == start_hold_period & codigo %in% assets_decile[[j]]) %>% 
+      dplyr::select(!c(date, codigo)) %>% 
+      mutate(across(everything(), ~ mean(.x, na.rm = TRUE))) %>% 
+      head(1)
+
+    rownames(features_month) <- start_hold_period
+    
+    features_decile[[j]] <- features_month
+      
+  }
+
+  ret_decile_dates[[i]] <- ret_decile
+  
+  features_decile_dates[[i]] <- features_decile
+}
+
+```
+
+```{r}
+port_deciles <- lapply(as.list(1:length(ret_decile_dates[[1]])), function(x) lapply(ret_decile_dates, function(y) y[[x]]))
+
+port_deciles <- lapply(port_deciles, function(x) do.call('rbind.xts', x))
+
+port_deciles <- do.call('cbind.xts', port_deciles)
+
+colnames(port_deciles) <- paste0('Decil ', 1:ncol(port_deciles))
+```
+
+```{r}
+features_decile <- lapply(as.list(1:length(features_decile_dates[[1]])), function(x) lapply(features_decile_dates, function(y) y[[x]]))
+
+features_decile <- lapply(features_decile, function(x) do.call('rbind', x))
+
+features_decile <- lapply(features_decile, function(x) data.frame(apply(x, 2, mean)))
+
+features_decile <- do.call('cbind', features_decile)
+colnames(features_decile) <- paste("Decile", 1:10)
+
+features_decile <- round(features_decile, 2)
+
+rownames(features_decile) <- c('AUM', 'Inflows', 'Outflows', '# Shareholders',
+                               'Leveraged', 'FoF', 'Exclusive', 'Age')
+```
+
+
+# Table 1
+
+# Table 1 - Funds' statistics
+
+```{r}
+final_df <- read.csv('data_modelling.csv') 
+
+num_funds <- final_df %>%
+  group_by(year, month) %>% 
+  summarise(funds_num = length(month))
+
+num_funds <- as.data.frame(apply(num_funds, 2, summary))
+
+df_summary <- final_df %>% 
+  dplyr::select(!c(year, month, aplic_min_inic, invest_qualificado, prazo_receb_resg, codigo)) %>% 
+  drop_na()
+
+df_summary <- as.data.frame(apply(df_summary, 2, summary))
+
+df_summary <- df_summary %>% 
+  mutate(num_funds = num_funds$funds_num, .before = 1) %>%
+  mutate(across(everything(), ~ round(.x, 2))) %>% 
+  t() %>% 
+  as.data.frame()
+
+rownames(df_summary) <- c("# Funds", "Abnormal Return",  "MIR (STM)", "CVaR (STM)", "Track Error (STM)", "Alpha (STM)", "Beta-Market (STM)", "Beta-Size (STM)", "Beta-Value (STM)", "Beta-Momentum (STM)",
+                 "MIR (Mom.)", "CVaR (Mom.)", "Track Error (Mom.)", "Alpha (Mom.)", "Beta-Market (Mom.)", "Beta-Size (Mom.)", "Beta-Value (Mom.)", "Beta-Momentum (Mom.)",
+                 "MIR (STR)", "CVaR (STR)", "Track Error (STR)", "Alpha (STR)", "Beta-Market (STR)", "Beta-Size (STR)", "Beta-Value (STR)", "Beta-Momentum (STR)",
+                 "AUM", "Inflows", "Outflows", "% Flow", "# Shareholders", "Leveradge", "Open", "FoF", "Exclusive", "Age")
+```
+
+
+# Figure 1
+
+```{r}
+port_deciles_df <- data.frame(Date = index(port_deciles), port_deciles)
+colnames(port_deciles_df) <- c('Date', paste0('Decile ', 1:ncol(port_deciles)))
+
+port_deciles_df_long <- port_deciles_df
+
+port_deciles_df_long[,-1] <- apply(port_deciles_df_long[,-1], 2, function(x) cumprod(1 + x) - 1)
+
+port_deciles_df_long <- port_deciles_df_long %>% 
+  pivot_longer(!Date, names_to = 'Portfolio', values_to = 'Return') %>% 
+  mutate(Portfolio = factor(Portfolio, levels = paste0('Decile ', 1:ncol(port_deciles))))
+```
+
+```{r}
+fig <- ggplot(data = port_deciles_df_long, aes(x = Date, y = Return)) +
+  geom_line(aes(x = Date, y = Return, group = Portfolio, color = Portfolio)) +
+  theme_classic() + xlab('') + scale_color_brewer(palette="Paired") +
+  theme(legend.title = element_blank(),
+        legend.position = 'bottom')
+
+fig
+```
+
+# Table 2 - Pooled Panel Regression
+
+```{r}
+features <- read.csv('data_modelling.csv')  %>% 
+  dplyr::select(!c(year, month, aplic_min_inic, invest_qualificado, prazo_receb_resg, codigo)) %>% 
+  drop_na()
+
+linear_regres <- lm(dep_var ~ ., data = features)
+
+variable_names <- c("MIR (STM)", "CVaR (STM)", "Track Error (STM)", "Alpha (STM)", "Beta-Market (STM)", "Beta-Size (STM)", "Beta-Value (STM)", "Beta-Momentum (STM)",
+                 "MIR (Mom.)", "CVaR (Mom.)", "Track Error (Mom.)", "Alpha (Mom.)", "Beta-Market (Mom.)", "Beta-Size (Mom.)", "Beta-Value (Mom.)", "Beta-Momentum (Mom.)",
+                 "MIR (STR)", "CVaR (STR)", "Track Error (STR)", "Alpha (STR)", "Beta-Market (STR)", "Beta-Size (STR)", "Beta-Value (STR)", "Beta-Momentum (STR)",
+                 "AUM", "Inflows", "Outflows", "% Flow", "# Shareholders", "Leveradge", "Open", "FoF", "Exclusive", "Age", "Constant")
+
+
+stargazer(linear_regres,
+          title="Pooled Regression", align=TRUE, 
+          covariate.labels = variable_names,
+          dep.var.labels = "Abnormal Return",
+          no.space = TRUE, single.row=TRUE)
+
+```
+
+
+# Table 3 - Summary Statistics
+
+```{r}
+stat_ret <- function(ret_port, ind, rf, nefin) {
+  
+  # CAPM
+  regres <- lm(I(ret_port - Risk_free) ~ Rm_minus_Rf + SMB + HML + WML, data = nefin)
+  # Get regression coefficients
+  regres_coef <- summary(regres)$coefficients
+  
+  alpha <- (regres_coef[1, 1] + 1) ^ 252 - 1
+  t_alpha <- regres_coef[1, 3]
+  
+  beta <- regres_coef[2, 1]
+  
+  cumulative_ret <- prod(ret_port + 1)^(252 / length(ret_port)) - 1
+  # Portfolio volatility
+  vol <- sd(ret_port) * sqrt(252)
+
+  # Israelsen Information Ratio (ttps://doi.org/10.1057/palgrave.jam.2240158)
+  ER <- (1 + mean(ret_port - ind)) ^ 252 - 1
+  SD <- sd(ret_port - ind) * sqrt(252)
+  mir <- ER / (SD^(ER / abs(ER))) # Modified IR
+  
+  # Israelsen Sharpe Ratio (https://doi.org/10.1057/palgrave.jam.2240158)
+  ER <- (1 + mean(ret_port - rf)) ^ 252 - 1
+  SD <- sd(ret_port - rf) * sqrt(252)
+  msr <- ER / (SD^(ER / abs(ER))) # Modified SR
+  
+  # Tracking Error
+  track_error <- sd(ret_port - ind) * (252 ^ (0.5))
+  
+  # CVaR
+  cvar <- CVaR(ret_port)
+  
+  # Maximum Drawdown
+  max_draw <- maxDrawdown(ret_port)
+  
+  results <- data.frame(c(
+    cumulative_ret, vol, 
+    alpha, t_alpha, beta, 
+    mir, msr, track_error,
+    cvar, max_draw
+  )) 
+  
+  rownames(results) <- c(
+    "Annual. Return",
+    "Std. Deviation", 
+    "Alpha", "t(alpha)",
+    "Beta", "Info. Ratio", 
+    "Sharpe Ratio", "Track Error",
+    "CVaR", "Max. Drawdown"
+  )
+  
+  results[c(1, 2, 3, 8, 9, 10), 1] <- round(results[c(1, 2, 3, 8, 9, 10), 1]*100, 2)
+  results[c(4, 5, 6, 7), 1] <- round(results[c(4, 5, 6, 7), 1], 2)
+  
+  return(results)
+}
+
+```
+
+```{r}
+nefin_eval <- nefin %>% 
+  dplyr::filter(Data >= port_deciles_df$Date[1] & Data <= port_deciles_df$Date[length(port_deciles_df$Date)])
+
+ind_eval <- ind_rf %>% 
+  dplyr::filter(Data >= port_deciles_df$Date[1] & Data <= port_deciles_df$Date[length(port_deciles_df$Date)])
+
+port_deciles_stats <- port_deciles_df %>% 
+  mutate(IBX = ind_eval$ret_ibx)
+
+deciles_stats <- as.data.frame(apply(port_deciles_stats[,-1], 2, function(x) stat_ret(x, ind_eval$ret_ibx, nefin_eval$Risk_free, nefin_eval)))
+
+colnames(deciles_stats) <- c(paste0('Decile ', 1:n_ports), "IBX")
+
+deciles_stats[c(3, 4, 5, 6, 8), ncol(deciles_stats)] <- NA
+```
+
+```{r}
+features_decile$IBX <- NA
+
+deciles_stats <- rbind(deciles_stats, features_decile)
+```
+
+# Figure 2
+
+```{r}
+models_pred <- as.list(list.files('predictions'))
+
+models_pred <-  lapply(models_pred, function(x) read.csv(paste0('predictions/', x)))
+
+# MAE
+mae <- unlist(lapply(models_pred, function(x) sum(abs(x$prediction - x$true_value)) / nrow(x)))
+
+# Execution time
+exe_time <- unlist(lapply(models_pred, function(x) tail(x$execution_time, 1)))
+```
+
+```{r}
+ret_ml_models <- vector('list', length = length(models_pred))
+for (i in seq_along(models_pred)) {
+  predictions <- models_pred[[i]]
+  
+  diff_db <- setdiff(as.character(predictions$funds_code), colnames(daily_data[['cota']])[-1])
+
+  dates <- get_backtest_dates(20080101, 20211231, 1)
+  
+  nefin_hold_period <- nefin %>% 
+    dplyr::filter(Data >= dates$start_hold_period[1] & Data < dates$end_hold_period[nrow(dates)]) %>% 
+    dplyr::select(Data, Risk_free)
+  nefin_hold_period <- xts(nefin_hold_period[,-1], nefin_hold_period$Data)
+  
+  ret_algo_dates <- vector('list', length = nrow(dates))
+  for (j in 1:nrow(dates)) {
+    
+    start_hold_period <- dates$start_hold_period[j]
+    end_hold_period <- dates$end_hold_period[j]
+    
+    predictions_month <- predictions %>% 
+      dplyr::filter(date == start_hold_period) %>% 
+      arrange(desc(prediction)) %>% 
+      dplyr::filter(funds_code %ni% diff_db)
+  
+    # We find the break points to divide the data frame in 'n_ports' (10, e.g.) equal parts
+    
+    assets_tercil <- list(head(predictions_month, nrow(predictions_month) * 0.3)$funds_code,
+                          tail(predictions_month, nrow(predictions_month) * 0.3)$funds_code)
+  
+    ret_algo <- vector('list', length = length(assets_tercil))
+    for (k in seq_along(assets_tercil)) {
+      # Calculate portfolio returns
+      cota_hold_period <- daily_data[['cota']] %>% 
+        dplyr::filter(Data >= start_hold_period & Data < end_hold_period) %>% 
+        dplyr::select(Data, all_of(as.character(assets_tercil[[k]])))
+      cota_hold_period <- xts(cota_hold_period[, -1], cota_hold_period$Data)
+      
+      weights <- rep(1 / ncol(cota_hold_period), ncol(cota_hold_period))
+      
+      ret_algo[[k]] <- Return.portfolio(cota_hold_period, weights = weights)
+        
+    }
+  
+    ret_algo_dates[[j]] <- ret_algo
+  
+  }
+  
+  ret_algo_dates <- lapply(as.list(1:length(ret_algo_dates[[1]])), function(x) lapply(ret_algo_dates, function(y) y[[x]]))
+  
+  ret_algo_dates <- lapply(ret_algo_dates, function(x) do.call('rbind.xts', x))
+  
+  ret_algo_dates <- do.call('cbind.xts', ret_algo_dates)
+  
+  ret_algo_dates <- cbind.xts(ret_algo_dates, nefin_hold_period)
+  
+  ret_ml_models[[i]] <- Return.portfolio(ret_algo_dates, weights = c(1, -1, 1))
+
+}
+```
+
+```{r}
+nefin_hold_period <- nefin %>% 
+  dplyr::filter(Data >= dates$start_hold_period[1] & Data < dates$end_hold_period[nrow(dates)]) 
+
+ml_regres_models <- lapply(ret_ml_models, function(x) lm(I(x - Risk_free) ~ Rm_minus_Rf + SMB + HML + WML, data = nefin_hold_period))
+
+ml_alphas <- lapply(ml_regres_models, function(x) coef(x)[1])
+
+ml_annual_alphas <- unlist(lapply(ml_alphas, function(x) (1 + x) ^ 252 - 1))
+```
+
+```{r}
+models_names <- c("ADA", "DT", "DUM", "EN", "ET", "GB", "KNN",
+                  "LAS", "LGB", "LR", "RF", "RID", "SVM", "XGB")
+
+models_types <- c("Ensemble", "Others", "Others", "Linear", "Ensemble", 
+                  "Ensemble", "Others", "Linear", "Ensemble", "Linear",
+                  "Ensemble", "Linear", "Others", "Ensemble")
+
+ml_models_df <- data.frame(algo = models_names,
+                           types = models_types,
+                           mae = mae,
+                           alpha = ml_annual_alphas,
+                           exe_time = exe_time)
+```
+
+```{r}
+regres <- lm(ml_models_df$alpha ~ ml_models_df$mae)
+
+summary(regres)
+```
+
+
+```{r}
+models_fig <- ggplot(ml_models_df, aes(x = mae, y = alpha)) +
+  geom_point(aes(size = exe_time, color = types)) +
+  geom_label_repel(label = ml_models_df$algo,  size=3.5) +
+  scale_size_continuous(range = c(1, 15)) +
+  theme_classic() +
+  xlab("Mean Absolute Error") + ylab("Annual. Alpha") +
+  labs(color = "Model Type", size = "Exe. Time") + 
+  theme(axis.title.x = element_text(vjust=-0.5),
+        axis.title.y = element_text(vjust=1.5))
+
+fig
+```
+

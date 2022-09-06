@@ -7,6 +7,7 @@ output: html_notebook
 
 ```{r, message=FALSE, warning=FALSE, results='hide'}
 library(tidyverse)
+library(readxl)
 library(xts)
 library(PerformanceAnalytics)
 library(lubridate)
@@ -29,6 +30,13 @@ ind_rf <- ind %>%
   mutate(rf$Risk_free) %>%
   set_names("Data", "ret_ibx", "ret_rf")
 
+nefin <- read_excel('fatores_nefin.xls') %>% 
+  mutate(Data = make_date(year, month, day)) %>% 
+  dplyr::select(!c(year, month, day)) %>% 
+  dplyr::select(Data, everything()) %>% 
+  dplyr::filter(Data <= '2021-12-30') %>% 
+  slice(-1)
+
 rm(ind, rf)
 ```
 
@@ -37,11 +45,28 @@ Funds' information:
 ```{r}
 daily_data <- readRDS("dados_tratados_diarios.rds")
 names(daily_data) <- c("capt_liq", "capt", "cota", "n_cotistas", "patrim_liq", "resg", "tx_adm")
+
+cadastral_info <- readRDS("dados_cadastrais.rds")
 ```
 
-```{r}
-cadastral_info <- readRDS("dados_cadastrais.rds")
+We have some outliers in our return database
 
+```{r}
+df_cota <- daily_data[['cota']] %>% 
+  dplyr::filter(Data >= '2004-02-01')
+
+df_cota_out <- as.data.frame(apply(df_cota[,-1], 2, function(x) length(x[(x <= -0.80 | x > 0.8) & !is.na(x)]))) %>% 
+  set_names('outliers') %>% 
+  dplyr::filter(outliers != 0)
+
+rm(df_cota)
+
+# Winsorizing
+daily_data[['cota']][,-1][daily_data[['cota']][,-1] <= -0.8 | daily_data[['cota']][,-1] > 0.8] <- 0
+```
+
+
+```{r}
 # We transform our columns so it can be used in a model
 cadastral_info <- cadastral_info %>%
   dplyr::select(codigo, invest_qualificado, alavancado, data_inicio, prazo_conv_resg, prazo_pag_resg, aplic_min_inic, forma_condominio, fundo_cotas, fundo_exclusivo, data_inicio, data_fim) %>%
@@ -65,25 +90,34 @@ cadastral_info <- cadastral_info %>% dplyr::filter(codigo %ni% diff_cadastral_da
 # Funds selection
 
 * The fund needs to be active for at least 12 months;
-* During these 12 months, the fund needs to have data for at least 1 day when the market was open;
-* The fund cannot be an exclusive one.
+* During these 12 months, the fund needs to have data for at least 90% of the days when the market was open;
+* During the evaluation period the fund needs to have data for at least 90% of the days when the market was open.
 
 ```{r}
 # start_pre_date = when the estimation date will start
 # end_pre_date = when the estimation date will end
+# start_eval_date = when the evaluation date will start
+# end_eval_date = when the evaluation date will end
 
-get_funds_eleg <- function(start_pre_date, end_pre_date) {
-  # First and second restrictions
+get_funds_eleg <- function(start_pre_date, end_pre_date, start_eval_date, end_eval_date) {
+  # First restrictions
   funds_eleg <- cadastral_info %>%
     dplyr::filter(data_inicio <= start_pre_date & (data_fim >= end_pre_date | is.na(data_fim))) %>% # First
-    dplyr::filter(fundo_exclusivo == 0) %>% # Second
     dplyr::select(codigo)
 
-  # Third restriction
+  # Second restriction
   funds_eleg <- daily_data[["cota"]] %>%
     dplyr::filter(Data >= start_pre_date & Data <= end_pre_date) %>%
     dplyr::select(all_of(funds_eleg$codigo)) %>%
-    dplyr::select_if(~ !any(is.na(.)))
+    dplyr::select_if(~ sum(is.na(.)) <= length(.)*0) %>% 
+    dplyr::select_if(~ sum(. == 0) <= length(.)*0.1 )
+  
+  # Third restriction
+  funds_eleg <- daily_data[["cota"]] %>%
+    dplyr::filter(Data >= start_eval_date & Data <= end_eval_date) %>%
+    dplyr::select(all_of(colnames(funds_eleg))) %>%
+    dplyr::select_if(~ sum(is.na(.)) <= length(.)*0) %>% 
+    dplyr::select_if(~ sum(. == 0) <= length(.)*0.1)
 
   funds_eleg <- colnames(funds_eleg)
 
@@ -96,109 +130,74 @@ get_funds_eleg <- function(start_pre_date, end_pre_date) {
 ## Returns Statistics
 
 ```{r}
-# ret_port = portfolio return
-# ind = index return
-# rf = risk free return
 
-get_stat_ret <- function(ret_port, ind, rf) {
-
-  # Annualized Cumulative Return
-  ret_period <- function(ret) {
-    prod(ret + 1) ^ (252 / length(ret)) - 1
-  }
-
-  # CAPM
-  regres <- lm(I(ret_port - rf) ~ I(ind - rf))
+get_regres_info <- function(ret_xts, name){
+  # 4 factor regression
+  regres <- lm(I(ret_port - Risk_free) ~ Rm_minus_Rf + SMB + HML + WML, data = ret_xts)
+  
   # Get regression coefficients
   regres_coef <- summary(regres)$coefficients
-
-  # Jansen's Alpha
-  alpha <- (regres_coef[1, 1] + 1) ^ 252 - 1
-  # CAPM Beta
-  beta <- regres_coef[2, 1]
-
-  # Portfolio annualized cumulative return
-  cumulative_ret <- ret_period(ret_port)
-
-  # Annualized Portfolio volatility
-  vol <- sd(ret_port) * sqrt(252)
-
-  # Israelsen Sharpe Ratio and Information Ratio (ttps://doi.org/10.1057/palgrave.jam.2240158)
-  ER <- mean(ret_port - rf)
-  SD <- sd(ret_port - rf)
-  MSR <- ER / (SD^(ER / abs(ER))) # Modified SR
-
-  ER <- mean(ret_port - ind)
-  SD <- sd(ret_port - ind)
-  MIR <- ER / (SD^(ER / abs(ER))) # Modified IR
+  ## Alpha
+  alpha <- regres_coef[1, 1]
+  ## Beta Market
+  beta_mercado <- regres_coef[2, 1]
+  ## Beta Size
+  beta_size <- regres_coef[3, 1]
+  ## Beta Value
+  beta_value <- regres_coef[4, 1]
+  ## Beta Mom
+  beta_mom <- regres_coef[5, 1]
+  
+  regres_info <- data.frame(
+    alpha, beta_mercado, beta_size,
+    beta_value, beta_mom
+  )
+  
+  # Israelsen Information Ratio (ttps://doi.org/10.1057/palgrave.jam.2240158)
+  ER <- mean(ret_xts$ret_port - ret_xts$ind)
+  SD <- sd(ret_xts$ret_port - ret_xts$ind)
+  mir <- ER / (SD^(ER / abs(ER))) # Modified IR
 
   # CVaR
-  cvar <- CVaR(ret_port, method = "historical")
-
-  results <- data.frame(
-    cumulative_ret, vol, MSR, MIR,
-    beta, alpha, cvar
-  )
-
-  return(results)
-}
-```
-
-```{r}
-# ret_port = portfolio return
-# ind = index return
-# rf = risk free return
-
-get_stat_ret <- function(ret_port, ind, rf) {
-
-  # Annualized Cumulative Return
-  ret_period <- function(ret) {
-    prod(ret + 1) ^ (252 / length(ret)) - 1
-  }
-
-  # CAPM
-  regres <- lm(I(ret_port - rf) ~ I(ind - rf))
-  # Get regression coefficients
-  regres_coef <- summary(regres)$coefficients
-
-  # Jansen's Alpha
-  alpha <- (regres_coef[1, 1] + 1) ^ 252 - 1
-  # CAPM Beta
-  beta <- regres_coef[2, 1]
-
-  # Portfolio annualized cumulative return
-  cumulative_ret <- ret_period(ret_port)
-  
-  # Index annualized cumulative return
-  cumulative_ind <- ret_period(ind)
-
-  # Annualized Portfolio volatility
-  vol <- sd(ret_port) * sqrt(252)
-  
-  # Annualized Index volatility
-  vol_ind <- sd(ret_port) * sqrt(252)
+  cvar <- CVaR(ret_xts$ret_port)
+  colnames(cvar) <- 'cvar'
   
   # Tracking Error
-  track_error <- sd(ret_port - ind) * sqrt(252)
+  track_error <- sd(ret_xts$ret_port - ret_xts$ind)
+  
+  stats <- data.frame(mir, cvar, track_error)
+  
+  stats <- cbind(stats, regres_info)
+  
+  colnames(stats) <- paste(name, colnames(stats), sep = '_')
+  
+  return(stats)
+}
 
-  # Israelsen Sharpe Ratio and Information Ratio (ttps://doi.org/10.1057/palgrave.jam.2240158)
-  ER <- mean(ret_port - rf)
-  SD <- sd(ret_port - rf)
-  MSR <- ER / (SD^(ER / abs(ER))) # Modified SR
-
-  ER <- mean(ret_port - ind)
-  SD <- sd(ret_port - ind)
-  MIR <- ER / (SD^(ER / abs(ER))) # Modified IR
-
-  # CVaR
-  cvar <- CVaR(ret_port, method = "historical")
-
-  results <- data.frame(
-    cumulative_ret, vol, 
-    track_error, MIR, MSR,
-    beta, alpha, cvar,
-    cumulative_ind, vol_ind
-  )
+get_stat_ret <- function(ret_port, ind, nefin) {
+  
+  ret_pre_xts <- data.frame(nefin, ret_port, ind)
+  ret_xts <- xts(ret_pre_xts[,-1], ret_pre_xts$Data)
+  
+  # Full sample
+  #full_info <- get_regres_info(ret_xts, 'full')
+  
+  # Short term momentum (Lagged one-month abnormal return)
+  f_r2_1 <- first(last(ret_xts, '2 months'), '1 month')
+  f_r2_1_info <- get_regres_info(f_r2_1, 'f_r2_1')
+  
+  # Momentum (Mean abnormal return from past 12 months)
+  f_r12_2 <- first(last(ret_xts, '12 months'), '10 month')
+  f_r12_2_info <- get_regres_info(f_r12_2, 'f_r12_2')
+  
+  # Short-term reversal (Prior month abnormal return)
+  f_st_rev <- last(ret_xts, '1 month')
+  f_st_rev_info <- get_regres_info(f_st_rev, 'f_st_rev')
+  
+  results_list <- list(f_r2_1_info, f_r12_2_info,
+                       f_st_rev_info)
+  
+  results <- do.call('cbind', results_list)
 
   return(results)
 }
@@ -218,10 +217,13 @@ get_funds_stat <- function(start_pre_date, end_pre_date, funds_eleg) {
     dplyr::filter(Data >= start_pre_date & Data <= end_pre_date) %>%
     dplyr::select(all_of(funds_eleg))
 
-  ind_rf_pre <- ind_rf %>% dplyr::filter(Data >= start_pre_date & Data <= end_pre_date)
+  ind_rf_pre <- ind_rf %>% 
+    dplyr::filter(Data >= start_pre_date & Data <= end_pre_date)
+  
+  nefin_pre <- nefin %>% 
+    dplyr::filter(Data >= start_pre_date & Data <= end_pre_date)
 
-  funds_stats <- lapply(funds_returns, function(x) get_stat_ret(x, ind_rf_pre$ret_ibx, ind_rf_pre$ret_rf))
-
+  funds_stats <- lapply(funds_returns, function(x) get_stat_ret(x, ind_rf_pre$ret_ibx, nefin_pre))
   funds_stats <- do.call("rbind", funds_stats)
 
   # Assets Under Management
@@ -229,9 +231,10 @@ get_funds_stat <- function(start_pre_date, end_pre_date, funds_eleg) {
     dplyr::filter(Data >= start_pre_date & Data <= end_pre_date) %>%
     dplyr::select(all_of(funds_eleg))
 
-  funds_aum <- lapply(funds_aum, function(x) mean(x, na.rm = TRUE))
+  funds_aum <- lapply(funds_aum, function(x) tail(x[!is.na(x)], 1))
 
-  funds_aum <- as.data.frame(do.call("rbind", funds_aum)) %>% set_names("aum")
+  funds_aum <- as.data.frame(do.call("rbind", funds_aum)) %>% 
+    set_names("aum")
 
   # Inflow
   funds_inflow <- daily_data[["capt"]] %>%
@@ -240,7 +243,8 @@ get_funds_stat <- function(start_pre_date, end_pre_date, funds_eleg) {
 
   funds_inflow <- lapply(funds_inflow, function(x) sum(x, na.rm = TRUE))
 
-  funds_inflow <- as.data.frame(do.call("rbind", funds_inflow)) %>% set_names("inflow")
+  funds_inflow <- as.data.frame(do.call("rbind", funds_inflow)) %>% 
+    set_names("inflow")
 
   # Outflow
   funds_outflow <- daily_data[["resg"]] %>%
@@ -249,16 +253,29 @@ get_funds_stat <- function(start_pre_date, end_pre_date, funds_eleg) {
 
   funds_outflow <- lapply(funds_outflow, function(x) sum(x, na.rm = TRUE))
 
-  funds_outflow <- as.data.frame(do.call("rbind", funds_outflow)) %>% set_names("outflow")
+  funds_outflow <- as.data.frame(do.call("rbind", funds_outflow)) %>% 
+    set_names("outflow")
+  
+  # % Flow
+  funds_flow_pct <- daily_data[["patrim_liq"]] %>%
+    dplyr::filter(Data >= start_pre_date & Data <= end_pre_date) %>%
+    dplyr::select(all_of(funds_eleg))
+
+  funds_flow_pct <- lapply(funds_flow_pct, function(x) head(x[!is.na(x)], 1))
+
+  funds_flow_pct <- as.data.frame(do.call("rbind", funds_flow_pct)) %>% 
+    set_names("pct_flow") %>% 
+    mutate(pct_flow = (funds_inflow$inflow - funds_outflow$outflow) / pct_flow)
 
   # Number of shareholders
   funds_share_hold <- daily_data[["n_cotistas"]] %>%
     dplyr::filter(Data >= start_pre_date & Data <= end_pre_date) %>%
     dplyr::select(all_of(funds_eleg))
 
-  funds_share_hold <- lapply(funds_share_hold, function(x) mean(x, na.rm = TRUE))
+  funds_share_hold <- lapply(funds_share_hold, function(x) tail(x[!is.na(x)], 1))
 
-  funds_share_hold <- as.data.frame(do.call("rbind", funds_share_hold)) %>% set_names("shareholders")
+  funds_share_hold <- as.data.frame(do.call("rbind", funds_share_hold)) %>% 
+    set_names("shareholders")
 
   # Join all data frames
   merge.all <- function(x, ..., by = "row.names") {
@@ -271,20 +288,36 @@ get_funds_stat <- function(start_pre_date, end_pre_date, funds_eleg) {
     return(x)
   }
 
-  funds_stats <- merge.all(funds_stats, funds_aum, funds_inflow, funds_outflow, funds_share_hold)
+  funds_stats <- merge.all(funds_stats, funds_aum, funds_inflow, funds_outflow, funds_flow_pct, funds_share_hold)
 
   return(funds_stats)
 }
 ```
 
-# Dependent Variable (0 or 1)
+# Dependent Variable
 
 ```{r}
+alpha_eval <- function(ret, nefin){
+  regres <- lm(I(ret - Risk_free) ~ Rm_minus_Rf + SMB + HML + WML, data = nefin)
+  
+  alpha <-  summary(regres)$coefficients[1,1]
+  
+  return(alpha)
+}
+
+abnormal_ret <- function(ret, nefin){
+  regres <- lm(I(ret - Risk_free) ~ Rm_minus_Rf + SMB + HML + WML, data = nefin)
+  
+  regres_coefs <- summary(regres)$coefficients[-1, 1]
+  
+  return(regres_coefs)
+}
+
 # start_eval_date = when the evaluation date will start
 # end_eval_date = when the evaluation date will end
 # funds_eleg = which funds meet all the restrictions (result from "get_funds_eleg")
 
-get_dependent_var <- function(start_eval_date, end_eval_date, funds_eleg, type) {
+get_dependent_var <- function(start_eval_date, end_eval_date, start_pre_date, end_pre_date, funds_eleg, type) {
   if(type == 'classif_closed'){
       # Determine which funds closed between the start and end of the evaluation period
     funds_closed <- cadastral_info %>%
@@ -298,10 +331,12 @@ get_dependent_var <- function(start_eval_date, end_eval_date, funds_eleg, type) 
     return(funds_closed)
 
   } else if(type == 'classif_outperfomance') {
-     funds_returns_eval <- daily_data[['cota']] %>% dplyr::filter(Data > start_eval_date & Data <= end_eval_date) %>%
-      dplyr::select(all_of(funds_eleg)) 
+    funds_returns_eval <- daily_data[['cota']] %>% 
+       dplyr::filter(Data > start_eval_date & Data <= end_eval_date) %>%
+       dplyr::select(all_of(funds_eleg)) 
     
-    ind_rf_eval <- ind_rf %>% dplyr::filter(Data > start_eval_date & Data <= end_eval_date)
+    ind_rf_eval <- ind_rf %>% 
+      dplyr::filter(Data > start_eval_date & Data <= end_eval_date)
     
     funds_stats_eval <- lapply(funds_returns_eval, function(x) prod(1 + (x - ind_rf_eval$ret_ibx), na.rm = TRUE) - 1)
     
@@ -310,6 +345,51 @@ get_dependent_var <- function(start_eval_date, end_eval_date, funds_eleg, type) 
     funds_stats_eval <- as.data.frame(ifelse(funds_stats_eval > 0, 1, 0)) %>% set_names('dep_var') # The name must be the same for generalization purposes
     
     return(funds_stats_eval)
+  } else if(type == 'regres_ab_ret'){
+    # Estimation data
+    funds_returns_estim <- daily_data[['cota']] %>% 
+      dplyr::filter(Data > start_pre_date & Data <= end_pre_date) %>%
+      dplyr::select(all_of(funds_eleg))
+    
+    nefin_estim <- nefin %>% 
+      dplyr::filter(Data > start_pre_date & Data <= end_pre_date)
+     
+    # Funds' coefficients in the estimation data
+    funds_coefs <- lapply(funds_returns_estim, function(x) abnormal_ret(x, nefin_estim))
+    
+    # Evaluation data
+    funds_returns_eval <- daily_data[['cota']] %>% 
+      dplyr::filter(Data >= start_eval_date & Data <= end_eval_date) %>%
+      dplyr::select(all_of(funds_eleg))
+    
+    funds_returns_eval <- apply(funds_returns_eval, 2, function(x) prod(1 + x) - 1)
+    
+    nefin_eval <- nefin %>% 
+      dplyr::filter(Data >= start_eval_date & Data <= end_eval_date) %>% 
+      dplyr::select(Rm_minus_Rf, SMB, HML, WML) 
+    
+    nefin_eval <- apply(nefin_eval, 2, function(x) prod(1 + x) - 1)
+    
+    # Funds' expected return
+    funds_exp_ret <- lapply(funds_coefs, function(x) sum(nefin_eval * x))
+    funds_exp_ret <- unlist(funds_exp_ret)
+    
+    # Funds' abnormal return
+    funds_abn_ret <- data.frame(dep_var = funds_returns_eval - funds_exp_ret)
+    
+    return(funds_abn_ret)
+  } else if(type == 'regres_alpha'){
+    funds_returns_eval <- daily_data[['cota']] %>% 
+      dplyr::filter(Data > start_eval_date & Data <= end_eval_date) %>%
+      dplyr::select(all_of(funds_eleg))
+    
+    nefin_eval <- nefin %>% 
+      dplyr::filter(Data > start_eval_date & Data <= end_eval_date)
+    
+    funds_abn_ret <- lapply(funds_returns_eval, function(x) alpha_eval(x, nefin_eval))
+    
+    funds_abn_ret <- as.data.frame(do.call('rbind', funds_abn_ret)) %>% set_names('dep_var')
+    
   } else if(type == 'regres_flows'){
     funds_flow <- daily_data[['capt_liq']] %>% dplyr::filter(Data >= start_eval_date & Data <= end_eval_date) %>%
         dplyr::select(all_of(funds_eleg)) 
@@ -330,13 +410,13 @@ get_dependent_var <- function(start_eval_date, end_eval_date, funds_eleg, type) 
       mutate(dep_var = ifelse(dep_var > 0, 1, 0))
     
     return(funds_flow)
-  } else if(type == 'all'){
-    types <- list('classif_closed', 'classif_outperfomance', 'regres_flows', 'classif_flows')
+  } else if(type == 'alpha_abn'){
+    types <- list('regres_alpha', 'regres_ab_ret')
     
     funds_info <- lapply(types, function(x) get_dependent_var(start_eval_date, end_eval_date, funds_eleg, x))
     
     funds_info <- do.call('cbind', funds_info) %>%
-      set_names('closed', 'outperf', 'regres_flows', 'classif_flows')
+      set_names(c('regres_alpha', 'regres_ab_ret'))
 
     return(funds_info)
   }
@@ -350,28 +430,23 @@ get_dependent_var <- function(start_eval_date, end_eval_date, funds_eleg, type) 
 get_final_df <- function(start_pre_date, end_pre_date, start_eval_date, end_eval_date, type) {
   
   # Which funds meet all the requirements?
-  funds_eleg <- get_funds_eleg(start_pre_date, end_pre_date)
+  funds_eleg <- get_funds_eleg(start_pre_date, end_pre_date, start_eval_date, end_eval_date)
 
   # Get the data regarding each funds
-  funds_ret_stat <- get_funds_stat(start_pre_date, end_pre_date, funds_eleg)
+  funds_ret_stat <- get_funds_stat(start_pre_date, end_pre_date, funds_eleg) %>% 
+    mutate(codigo = rownames(.), .before = 1)
 
   # Calculate how old was the fund at the end of the estimation period and get the cadastral information
   funds_cadastral <- cadastral_info %>%
     dplyr::filter(codigo %in% funds_eleg) %>%
     mutate(age = time_length(difftime(as.Date(end_pre_date), as.Date(data_inicio)), "years")) %>% # How old
-    `rownames<-`(.$codigo) %>%
-    dplyr::select(!c(codigo, data_inicio, data_fim, prazo_conv_resg, prazo_pag_resg)) # cadastral information
+    dplyr::select(!c(data_inicio, data_fim, prazo_conv_resg, prazo_pag_resg)) # cadastral information
 
   # Get our dependent variable
-  funds_dep_variable <- get_dependent_var(start_eval_date, end_eval_date, funds_eleg, type)
+  funds_dep_variable <- get_dependent_var(start_eval_date, end_eval_date, start_pre_date, end_pre_date, funds_eleg, type) %>% 
+    mutate(codigo = rownames(.), .before = 1)
 
-  funds_stat <- merge(funds_dep_variable, funds_ret_stat, by = 0) %>%
-    `rownames<-`(.$Row.names) %>%
-    dplyr::select(!Row.names)
-
-  funds_stat <- merge(funds_stat, funds_cadastral, by = 0) %>%
-    `rownames<-`(.$Row.names) %>%
-    dplyr::select(!Row.names)
+  funds_stat <- merge(merge(funds_dep_variable, funds_ret_stat, by = 'codigo'), funds_cadastral, by = 'codigo') 
 
   return(funds_stat)
 }
@@ -379,36 +454,49 @@ get_final_df <- function(start_pre_date, end_pre_date, start_eval_date, end_eval
 
 # Get clean data 
 
-```{r, message=FALSE, warning=FALSE}
+```{r message=FALSE, warning=FALSE, results='hide'}
 # How many months should we look back to calculate the statistics?
 look_back <- 12
 # How many months should we consider for making a prediction?
-pred_n_months <- 12
+pred_n_months <- 1
 # With what frequency (in months) should we make a new prediction?
 rebalance_n_months <- 1
 # When to start making a prediction
-start_eval_date <- as.Date("2017-01-01")
+start_eval_date <- as.Date("2005-01-01") # In fact, 2005-02-01, because we sum 1  month
 # What type of dependent variable we want? ('all' with we want all of them)
-type = 'all'
+type = 'regres_ab_ret'
 
-n_months <- interval(start_eval_date %m-% days(1), as.Date("2021-12-31")) %/% months(rebalance_n_months)
+n_months <- interval(start_eval_date %m-% days(1) %m+% months(pred_n_months), as.Date("2021-12-31")) %/% months(rebalance_n_months)
 final_df <- vector("list", length = n_months)
 for (i in 1:n_months) {
   start_eval_date <- as.Date(start_eval_date) %m+% months(rebalance_n_months)
-  end_estim_date <- start_eval_date %m-% days(1)
-  start_estim_date <- as.Date(end_estim_date) %m-% months(look_back)
+  end_pre_date <- start_eval_date %m-% days(1)
+  start_pre_date <- as.Date(end_pre_date) %m-% months(look_back)
   end_eval_date <- as.Date(start_eval_date) %m+% months(pred_n_months) %m-% days(1)
 
-  final_df[[i]] <- get_final_df(start_estim_date, end_estim_date, start_eval_date, end_eval_date, type) %>%
-    dplyr::select(!c(invest_qualificado, aplic_min_inic, fundo_exclusivo)) %>%
-    mutate_at(vars(forma_condominio, fundo_cotas), ~ ifelse(is.na(.x), 0, .x)) %>%
-    mutate(year = year(end_estim_date), month = month(end_estim_date))
+  final_df[[i]] <- get_final_df(start_pre_date, end_pre_date, start_eval_date, end_eval_date, type) %>%
+    mutate(year = year(start_eval_date), month = month(start_eval_date))
 }
 
-final_df <- do.call("rbind", final_df)
+final_df <- do.call("rbind", final_df) %>% 
+  as.data.frame(row.names = 1:nrow(.))
 ```
 
 ```{r}
-write.csv(final_df, 'data_modelling.csv')
+print('NAs:')
+apply(final_df, 2, function(x) sum(is.na(x)))
+
+print('Infinite')
+apply(final_df, 2, function(x) sum(is.infinite(x)))
+```
+
+
+```{r}
+summary(final_df)
+```
+
+
+```{r}
+write.csv(final_df, 'data_modelling.csv', row.names = FALSE)
 ```
 
