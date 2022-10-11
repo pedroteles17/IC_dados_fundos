@@ -11,6 +11,7 @@ library(readxl)
 library(xts)
 library(PerformanceAnalytics)
 library(lubridate)
+library(moments)
 
 `%ni%` <- Negate(`%in%`)
 ```
@@ -49,22 +50,36 @@ names(daily_data) <- c("capt_liq", "capt", "cota", "n_cotistas", "patrim_liq", "
 cadastral_info <- readRDS("dados_cadastrais.rds")
 ```
 
-We have some outliers in our return database
+We have some outliers in our return database. We winsorize them.
 
 ```{r}
-df_cota <- daily_data[['cota']] %>% 
-  dplyr::filter(Data >= '2004-02-01')
-
-df_cota_out <- as.data.frame(apply(df_cota[,-1], 2, function(x) length(x[(x <= -0.80 | x > 0.8) & !is.na(x)]))) %>% 
-  set_names('outliers') %>% 
-  dplyr::filter(outliers != 0)
-
-rm(df_cota)
+winsorize <- function (x, fraction = .01){
+   lim <- quantile(x, probs=c(fraction, 1-fraction), na.rm = TRUE)
+   
+   x[ x < lim[1]] <- lim[1]
+   x[ x > lim[2]] <- lim[2]
+   
+   return(x)
+}
 
 # Winsorizing
-daily_data[['cota']][,-1][daily_data[['cota']][,-1] <= -0.8 | daily_data[['cota']][,-1] > 0.8] <- 0
-```
+cota_diaria <- daily_data[['cota']]
 
+winsorized_row <- vector('list', length = nrow(cota_diaria))
+for (i in 1:nrow(cota_diaria)) {
+  row_values <- do.call('c', cota_diaria[i, -1, drop = TRUE])
+  
+  winsorized_row[[i]] <- winsorize(row_values)
+}
+
+winsorized_data <- do.call('rbind', winsorized_row)
+
+winsorized_data <- data.frame(Data = cota_diaria$Data, winsorized_data)
+
+colnames(winsorized_data) <- colnames(cota_diaria) 
+
+daily_data[['cota']] <- winsorized_data
+```
 
 ```{r}
 # We transform our columns so it can be used in a model
@@ -84,14 +99,16 @@ cadastral_info <- cadastral_info %>%
 diff_cadastral_daily <- setdiff(cadastral_info$codigo, colnames(daily_data[["cota"]]))
 
 # We keep only the funds that are in both databases
-cadastral_info <- cadastral_info %>% dplyr::filter(codigo %ni% diff_cadastral_daily)
+cadastral_info <- cadastral_info %>% 
+  dplyr::filter(codigo %ni% diff_cadastral_daily)
 ```
 
 # Funds selection
 
 * The fund needs to be active for at least 12 months;
 * During these 12 months, the fund needs to have data for at least 90% of the days when the market was open;
-* During the evaluation period the fund needs to have data for at least 90% of the days when the market was open.
+* During the evaluation period the fund needs to have data for at least 90% of the days when the market was open;
+* Incubation Bias: We eliminate funds with less than 10 million reais.
 
 ```{r}
 # start_pre_date = when the estimation date will start
@@ -118,8 +135,16 @@ get_funds_eleg <- function(start_pre_date, end_pre_date, start_eval_date, end_ev
     dplyr::select(all_of(colnames(funds_eleg))) %>%
     dplyr::select_if(~ sum(is.na(.)) <= length(.)*0) %>% 
     dplyr::select_if(~ sum(. == 0) <= length(.)*0.1)
+  
+  # Fourth restriction
+  assets_under_manag <- daily_data[["patrim_liq"]] %>%
+    dplyr::filter(Data >= start_pre_date & Data <= end_pre_date) %>%
+    dplyr::select(all_of(colnames(funds_eleg)))
+  assets_under_manag <- lapply(assets_under_manag, function(x) tail(x[!is.na(x)], 1))
+  assets_under_manag <- do.call('c', assets_under_manag)
+  assets_under_manag <- assets_under_manag[assets_under_manag > 10000]
 
-  funds_eleg <- colnames(funds_eleg)
+  funds_eleg <- names(assets_under_manag)
 
   return(funds_eleg)
 }
@@ -137,21 +162,31 @@ get_regres_info <- function(ret_xts, name){
   
   # Get regression coefficients
   regres_coef <- summary(regres)$coefficients
-  ## Alpha
-  alpha <- regres_coef[1, 1]
-  ## Beta Market
-  beta_mercado <- regres_coef[2, 1]
-  ## Beta Size
-  beta_size <- regres_coef[3, 1]
-  ## Beta Value
-  beta_value <- regres_coef[4, 1]
-  ## Beta Mom
-  beta_mom <- regres_coef[5, 1]
+  ## Alpha t-stat
+  alpha <- regres_coef[1, 3]
+  ## Beta Market t-stat
+  beta_mercado <- regres_coef[2, 3]
+  ## Beta Size t-stat
+  beta_size <- regres_coef[3, 3]
+  ## Beta Value t-stat
+  beta_value <- regres_coef[4, 3]
+  ## Beta Mom t-stat
+  beta_mom <- regres_coef[5, 3]
+  
+  ## R^2
+  r_squared <- summary(regres)$r.squared
+  
+  ## Idiosyncratic Volatility
+  ivol <- sd(regres$residuals)
   
   regres_info <- data.frame(
     alpha, beta_mercado, beta_size,
-    beta_value, beta_mom
+    beta_value, beta_mom, r_squared, 
+    ivol
   )
+  
+  # Kurtosis 
+  kurt_ret <- kurtosis(ret_xts$ret_port)
   
   # Israelsen Information Ratio (ttps://doi.org/10.1057/palgrave.jam.2240158)
   ER <- mean(ret_xts$ret_port - ret_xts$ind)
@@ -165,7 +200,7 @@ get_regres_info <- function(ret_xts, name){
   # Tracking Error
   track_error <- sd(ret_xts$ret_port - ret_xts$ind)
   
-  stats <- data.frame(mir, cvar, track_error)
+  stats <- data.frame(mir, cvar, track_error, kurt_ret)
   
   stats <- cbind(stats, regres_info)
   
